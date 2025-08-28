@@ -1,7 +1,0 @@
-mode: OFFLINE
-ui: { host: "127.0.0.1", port: 8501, base_url_path: "/" }
-storage: { sqlite_path: "data/edge.db", backup_dir: "data/backups" }
-models: { registry_dir: "models" }
-alerts: { email_enabled: false, toast_enabled: true }
-security: { auth_mode: "local", session_timeout_min: 20 }
-ota: { enabled: true, signed_only: true }
