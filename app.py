@@ -9,7 +9,6 @@ Author: ECE Student
 from __future__ import annotations
 
 import logging
-import time
 from datetime import datetime, timedelta
 import asyncio
 
@@ -27,6 +26,7 @@ from sklearn.preprocessing import StandardScaler
 # DOCTIGO EDGE CORE IMPORTS
 # --------------------------
 from edge_core import ProductionConfig
+from edge_core.storage import init_sqlite_if_needed  # NEW
 from edge_core import (
     DataManager,
     ProductionVitalsPredictor,
@@ -75,6 +75,7 @@ class MedicalDataGenerator:
         temp_noise = np.random.normal(0, 0.2, self.n_samples)
         body_temp = np.clip(temp_base + temp_noise, 35.5, 38.5)
 
+        # mild positive correlation
         corr = 0.3
         systolic_bp += corr * (body_temp - 36.7) * 2
         diastolic_bp += corr * (body_temp - 36.7) * 1.5
@@ -274,8 +275,34 @@ def main():
     if user_role:
         st.sidebar.success(f"Logged in as: {user_role}")
 
+    # Needed for all tabs below (config + DB init)
+    patient_id = "patient_001"
+    device_id = "edge_001"
+
+    # Load OFFLINE settings and ensure local DB exists
+    config = ProductionConfig.from_settings()     # CHANGED
+    init_sqlite_if_needed(config.sqlite_path)     # NEW
+
+    data_manager = DataManager(config)
+    predictor = ProductionVitalsPredictor(config)
+    twin_manager = DigitalTwinManager(predictor, data_manager)
+    alert_manager = AlertManager(config, data_manager)
+    ecg_sensor = SimulatedECGSensor(patient_id, device_id)
+    spo2_sensor = SimulatedPulseOximeter(patient_id, device_id)
+    bp_sensor = SimulatedBloodPressureMonitor(patient_id, device_id)
+
+    # Guard any cloud sync when offline
+    if not getattr(config, "offline", True):
+        try:
+            simulate_sync()
+        except Exception:
+            pass
+
+    # Helpful sidebar status
+    st.sidebar.caption(f"Mode: {'OFFLINE' if config.offline else 'ONLINE'} · DB: {config.sqlite_path}")
+
     # Set up role-based tabs
-    tab_names = []
+    tab_names: list[str] = []
     if user_role == "Admin":
         tab_names = [
             "👑 Admin Dashboard", "📡 Live Monitor", "📤 CSV Upload + Batch Predict",
@@ -301,23 +328,6 @@ def main():
 
     tabs = st.tabs(tab_names)
 
-    # Needed for all tabs below
-    patient_id = "patient_001"
-    device_id = "edge_001"
-    config = ProductionConfig()
-    data_manager = DataManager(config)
-    predictor = ProductionVitalsPredictor(config)
-    twin_manager = DigitalTwinManager(predictor, data_manager)
-    alert_manager = AlertManager(config, data_manager)
-    ecg_sensor = SimulatedECGSensor(patient_id, device_id)
-    spo2_sensor = SimulatedPulseOximeter(patient_id, device_id)
-    bp_sensor = SimulatedBloodPressureMonitor(patient_id, device_id)
-
-    try:
-        simulate_sync()
-    except Exception:
-        pass
-
     # =============== TAB LOGIC ===============
 
     # Admin-only dashboard
@@ -331,7 +341,7 @@ def main():
         with tabs[tab_names.index("📡 Live Monitor")]:
             st.subheader("📡 Live Vitals Monitoring")
             auto_refresh = st.checkbox("Enable Auto Mode", value=True)
-            refresh_rate = st.slider("Refresh Interval (seconds)", 1, 10, 3)
+            st.slider("Refresh Interval (seconds)", 1, 10, 3)  # currently not used as a timer
 
             graph_ph = st.empty()
             desc_ph = st.empty()
@@ -368,8 +378,8 @@ def main():
                     return
                 df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
                 fig = go.Figure()
-                alert_messages = []
-                latest_values = {}
+                alert_messages: list[str] = []
+                latest_values_for_plot: dict[str, float] = {}
 
                 sensor_colors = {"ECG": "red", "SpO2": "blue", "BP_SYS": "green", "BP_DIA": "orange"}
                 ranges = {
@@ -384,7 +394,7 @@ def main():
                     if s.empty:
                         continue
                     y = pd.to_numeric(s["value"], errors="coerce")
-                    latest_values[sensor] = y.iloc[-1]
+                    latest_values_for_plot[sensor] = y.iloc[-1]
                     fig.add_trace(
                         go.Scatter(x=s["timestamp"], y=y, mode="lines+markers", name=sensor, line=dict(color=sensor_colors[sensor]))
                     )
@@ -396,7 +406,7 @@ def main():
                     fig.add_hrect(y0=border_high, y1=max(y) + 10, fillcolor="red", opacity=0.1, line_width=0)
                     fig.add_hrect(y0=min(y) - 10, y1=border_low, fillcolor="red", opacity=0.1, line_width=0)
 
-                    val = latest_values[sensor]
+                    val = latest_values_for_plot[sensor]
                     if val < border_low or val > border_high:
                         alert_messages.append(f"🚨 {sensor}: {val} (Critical)")
                     elif val < safe_low or val > safe_high:
@@ -413,13 +423,20 @@ def main():
 
                 if alert_messages:
                     desc_ph.error("\n".join(alert_messages))
+                    # Optional local toasts (offline-friendly)
+                    if getattr(config, "alerts_toast", True):
+                        for m in alert_messages:
+                            st.toast(m)
                 else:
                     desc_ph.success("✅ All vitals in safe range.")
 
+                # DB-backed latest values for gauges (robust, fast)
+                latest_values = data_manager.get_latest_values(patient_id, ["ECG", "SpO2", "BP_SYS", "BP_DIA"])
+
                 gauge_cols = gauge_ph.columns(4)
                 for i, sensor in enumerate(["ECG", "SpO2", "BP_SYS", "BP_DIA"]):
-                    if sensor in latest_values:
-                        val = latest_values[sensor]
+                    val = latest_values.get(sensor)
+                    if val is not None:
                         color = sensor_colors[sensor]
                         gauge_cols[i].markdown(
                             f"""
@@ -443,7 +460,7 @@ def main():
             twin_manager.update_twin(patient_id, [], tw_preds)
             alert_manager.generate_alert(patient_id, twin_manager.get_twin(patient_id), tw_preds)
 
-    # CSV Upload/Batc Predictions Tab
+    # CSV Upload/Batch Predictions Tab
     if "📤 CSV Upload + Batch Predict" in tab_names:
         with tabs[tab_names.index("📤 CSV Upload + Batch Predict")]:
             st.subheader("📤 Upload Vitals CSV for Batch Predictions")
@@ -453,7 +470,7 @@ def main():
                     df_up = pd.read_csv(uploaded)
                     st.success("File uploaded!")
                     st.dataframe(df_up, use_container_width=True)
-                    # You can add batch prediction code here if you wish
+                    # (Optional) add batch import -> DataManager.bulk_store_vitals(...)
                 except Exception as e:
                     st.error(f"Error reading CSV: {e}")
             else:
